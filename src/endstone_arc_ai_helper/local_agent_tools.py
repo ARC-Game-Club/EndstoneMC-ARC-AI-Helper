@@ -29,6 +29,9 @@ TOOL_NAME_TO_ACTION: Dict[str, str] = {
     "mc_accept_offering": "accept_offering",
     "mc_grant_blessing": "grant_blessing",
     "mc_divine_intervention": "divine_intervention",
+    "mc_body_status": "body_status",
+    "mc_body_walk": "body_walk",
+    "mc_body_action": "body_action",
 }
 
 
@@ -169,6 +172,7 @@ def build_local_agent_tools(
     has_arc_core: bool = False,
     has_stock: bool = False,
     has_devotion: bool = False,
+    has_body: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return OpenAI tools list for local Agent loop."""
     tools: List[Dict[str, Any]] = [
@@ -448,6 +452,47 @@ def build_local_agent_tools(
         )
     if has_devotion:
         tools.extend(build_devotion_agent_tools())
+    if has_body:
+        tools.extend(
+            [
+                _fn(
+                    "mc_body_status",
+                    "查看你的虚拟玩家身体（SimulatedPlayer）的状态：在线、坐标、忙碌。"
+                    "和玩家约见面、确认自己位置时先调用本工具。",
+                    {},
+                ),
+                _fn(
+                    "mc_body_walk",
+                    "让你的身体走到指定坐标（引擎寻路，会绕开障碍与岩浆）。",
+                    {
+                        "x": {"type": "number"},
+                        "y": {"type": "number"},
+                        "z": {"type": "number"},
+                    },
+                    ["x", "y", "z"],
+                ),
+                _fn(
+                    "mc_body_action",
+                    "让你的身体执行动作。action 可取："
+                    "say(在聊天栏以身体身份说话,text=内容)、"
+                    "attack(攻击附近实体,target=生物或玩家名)、"
+                    "jump(跳)、stop(停下)、teleport(传送到 x/y/z)、"
+                    "drop(把背包物品丢给玩家,item/count/to)。",
+                    {
+                        "action": {"type": "string"},
+                        "x": {"type": "number"},
+                        "y": {"type": "number"},
+                        "z": {"type": "number"},
+                        "target": {"type": "string"},
+                        "text": {"type": "string"},
+                        "item": {"type": "string"},
+                        "count": {"type": "number"},
+                        "to": {"type": "string", "description": "丢物品给谁"},
+                    },
+                    ["action"],
+                ),
+            ]
+        )
     return tools
 
 

@@ -167,6 +167,7 @@ class ARCAIHelperPlugin(Plugin):
         self.logger.info("[ARC AI Helper] on_enable called")
         self._server_thread_id = threading.get_ident()
         self.register_events(self)
+        self._vp_missing_warned = False
 
         if not str(self.chat_config.get("server_name") or "").strip():
             self.logger.warning(
@@ -177,6 +178,18 @@ class ARCAIHelperPlugin(Plugin):
 
         self._start_worker_if_needed()
         self.astrbot_client.start()
+
+        # 虚拟玩家保活：每 60 秒确认一次助手身体在线，掉了自动拉起。
+        # arc_fake_player 的身体要等行为包握手（启动后几秒）才可用，
+        # 所以首次检查延后 10 秒。
+        scheduler = getattr(self.server, "scheduler", None)
+        if scheduler is not None:
+            try:
+                scheduler.run_task(
+                    self, self._ensure_virtual_player_safe,
+                    delay=200, period=1200)
+            except Exception as error:
+                self.logger.warning(f"[ARC AI Helper] 虚拟玩家保活任务注册失败: {error}")
 
         if not self.ai_manager.has_provider():
             self.logger.info(
@@ -439,6 +452,17 @@ class ARCAIHelperPlugin(Plugin):
                 text = self._run_on_server_thread(lambda: self._tool_devotion_adjust(payload))
             elif name in ("player_inventory", "inventory"):
                 text = self._run_on_server_thread(lambda: self._tool_player_inventory(payload))
+            elif name == "body_status":
+                text = self._run_on_server_thread(self._tool_body_status)
+            elif name == "body_walk":
+                text = self._run_on_server_thread(lambda: self._tool_body_action("walk", payload))
+            elif name == "body_action":
+                text = self._run_on_server_thread(
+                    lambda: self._tool_body_action(str(payload.get("action") or ""), payload))
+            elif name in ("body_say", "body_speak"):
+                text = self._run_on_server_thread(lambda: self._tool_body_action("say", payload))
+            elif name in ("body_drop", "body_give"):
+                text = self._run_on_server_thread(lambda: self._tool_body_action("drop", payload))
             elif name in ("accept_offering", "offering", "sacrifice"):
                 text = self._run_on_server_thread(lambda: self._tool_accept_offering(payload))
             elif name in ("grant_blessing", "blessing", "bless"):
@@ -1328,6 +1352,92 @@ class ARCAIHelperPlugin(Plugin):
         except Exception:
             return None
 
+    # ------------------------------------------------------------------
+    # 虚拟玩家身体（arc_fake_player 提供 SimulatedPlayer）
+    # ------------------------------------------------------------------
+
+    def _get_fake_player_plugin(self):
+        """拿 arc_fake_player 的插件对象。旧版没有 api_* 方法的返回 None。"""
+        plugin_manager = getattr(self.server, "plugin_manager", None)
+        if plugin_manager is None:
+            return None
+        try:
+            plug = plugin_manager.get_plugin("arc_fake_player")
+        except Exception:
+            return None
+        if not callable(getattr(plug, "api_body_action", None)):
+            return None
+        return plug
+
+    def _virtual_player_name(self) -> str:
+        if not bool(self.chat_config.get("virtual_player_enabled")):
+            return ""
+        return str(self.chat_config.get("virtual_player_name") or "").strip()
+
+    def _tool_body_status(self) -> str:
+        plug = self._get_fake_player_plugin()
+        if plug is None:
+            return "本服未安装 arc_fake_player（或版本过旧，需 ≥3.1.0），没有身体可用"
+        name = self._virtual_player_name()
+        if not name:
+            return "虚拟玩家未启用（chat_config.json 里 virtual_player_enabled=false）"
+        result = plug.api_body_status(name)
+        if not result.get("ok"):
+            return str(result.get("error") or "查询失败")
+        bodies = result.get("bodies") or []
+        mine = next((b for b in bodies if b.get("name", "").lower() == name.lower()), None)
+        if not mine or not mine.get("online"):
+            return f"你的身体 {name} 当前不在线（保活任务会自动拉起，稍后再查）"
+        return (f"你的身体 {name} 在线，坐标 "
+                f"({mine.get('x')}, {mine.get('y')}, {mine.get('z')})")
+
+    def _tool_body_action(self, action: str, payload: Dict[str, Any]) -> str:
+        plug = self._get_fake_player_plugin()
+        if plug is None:
+            return "本服未安装 arc_fake_player（或版本过旧，需 ≥3.1.0）"
+        name = self._virtual_player_name()
+        if not name:
+            return "虚拟玩家未启用（chat_config.json 里 virtual_player_enabled=false）"
+        action = str(action or "").strip().lower()
+        kwargs: Dict[str, Any] = {}
+        for key in ("x", "y", "z", "target", "text", "item", "count", "to"):
+            if key in payload and payload[key] is not None:
+                kwargs[key] = payload[key]
+        if action in ("walk", "teleport") and not all(
+                isinstance(kwargs.get(k), (int, float)) for k in ("x", "y", "z")):
+            return f"{action} 需要数字坐标 x/y/z"
+        result = plug.api_body_action(name, action, **kwargs)
+        if result.get("ok"):
+            return str(result.get("text") or "已执行")
+        return str(result.get("error") or "执行失败")
+
+    def _ensure_virtual_player_safe(self) -> None:
+        """保活任务的兜底壳：调度器回调里绝不能抛异常。"""
+        try:
+            self._ensure_virtual_player()
+        except Exception as error:
+            self.logger.warning(f"[ARC AI Helper] 虚拟玩家保活失败: {error}")
+
+    def _ensure_virtual_player(self) -> None:
+        """确保助手身体在线（幂等，掉了重新拉起）。"""
+        name = self._virtual_player_name()
+        if not name:
+            return
+        plug = self._get_fake_player_plugin()
+        if plug is None:
+            # 只在"用户想要身体但拿不到"时提示一次，别每分钟刷屏。
+            if not getattr(self, "_vp_missing_warned", False):
+                self._vp_missing_warned = True
+                self.logger.info(
+                    "[ARC AI Helper] 虚拟玩家已启用但 arc_fake_player 不可用"
+                    "（未安装或版本 <3.1.0），天星暂无身体")
+            return
+        result = plug.api_ensure_body(name)
+        if result.get("ok"):
+            if result.get("existed") is not True:
+                self.logger.info(
+                    f"[ARC AI Helper] 虚拟玩家 {name} 已上线（天星获得身体）")
+
     def _tool_skyeye_require_admin(self, payload: Dict[str, Any]) -> str:
         return self._tool_require_admin(payload)
 
@@ -1885,6 +1995,11 @@ class ARCAIHelperPlugin(Plugin):
                 "op_permission_level": "admin",
                 "permission_overrides": {},
                 "local_agent_max_tool_rounds": 8,
+                # 虚拟玩家身体（由 arc_fake_player 提供的 SimulatedPlayer）。
+                # enabled=true 时天星会一直以该名字的假人形态在线，
+                # 并可用 mc_body_* 工具操控身体（走过去/说话/丢东西…）。
+                "virtual_player_enabled": False,
+                "virtual_player_name": "TianXing",
             }
             with open(self.chat_config_path, "w", encoding="utf-8") as file:
                 json.dump(default_chat_config, file, ensure_ascii=False, indent=2)
@@ -1944,6 +2059,8 @@ class ARCAIHelperPlugin(Plugin):
         data.setdefault("permission_overrides", {})
         data.setdefault("local_agent_max_tool_rounds", 8)
         data.setdefault("devotion", dict(DEFAULT_DEVOTION_CONFIG))
+        data.setdefault("virtual_player_enabled", False)
+        data.setdefault("virtual_player_name", "TianXing")
 
         try:
             max_history = int(data.get("max_history_messages", 20))
@@ -2183,6 +2300,8 @@ class ARCAIHelperPlugin(Plugin):
             has_arc_core=self._get_arc_core_plugin() is not None,
             has_stock=self._get_stock_plugin() is not None,
             has_devotion=self._is_devotion_enabled(),
+            has_body=self._get_fake_player_plugin() is not None
+                     and bool(self._virtual_player_name()),
         )
         level_value = int(level)
         is_admin = level >= AIPermissionLevel.ADMIN
