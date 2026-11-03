@@ -34,6 +34,7 @@ from .devotion_guards import (
 )
 from .forbidden_items import forbidden_items_hint, is_forbidden_grant_item
 from .local_agent_tools import build_local_agent_tools, resolve_tool_action
+from . import mcp_registration
 from .player_inventory import (
     assess_offering_sincerity,
     count_item,
@@ -197,7 +198,48 @@ class ARCAIHelperPlugin(Plugin):
                 "否则需要配置本机模型后才能降级对话。"
             )
 
+        # 把 mc_* 工具注册进 arc_core 的 MCP 服务器（工具定义单一来源）。
+        # arc_core 可能比本插件晚 enable，先试一次，未加载则 100 tick 后重试。
+        if self.chat_config.get("mcp_register_tools", True):
+            try:
+                result = mcp_registration.register_to_arc_core(self)
+            except Exception as error:
+                self.logger.warning(f"[ARC AI Helper] MCP 工具注册异常: {error}")
+                result = {"ok": False, "error": str(error)}
+            if result.get("ok"):
+                self.logger.info(
+                    f"[ARC AI Helper] 已向 arc_core MCP 注册 {result.get('count', 0)} 个工具"
+                )
+            elif scheduler is not None:
+                scheduler.run_task(self, self._mcp_register_retry, delay=100)
+            else:
+                self.logger.warning(
+                    f"[ARC AI Helper] MCP 工具注册未完成: {result.get('error')}"
+                )
+
+    def _mcp_register_retry(self) -> None:
+        """arc_core 晚于本插件加载时的延迟注册重试（仅一次）。"""
+        if not self.chat_config.get("mcp_register_tools", True):
+            return
+        try:
+            result = mcp_registration.register_to_arc_core(self)
+        except Exception as error:
+            self.logger.warning(f"[ARC AI Helper] MCP 工具注册重试异常: {error}")
+            return
+        if result.get("ok"):
+            self.logger.info(
+                f"[ARC AI Helper] 已向 arc_core MCP 注册 {result.get('count', 0)} 个工具（延迟注册）"
+            )
+        else:
+            self.logger.warning(f"[ARC AI Helper] MCP 工具注册失败: {result.get('error')}")
+
     def on_disable(self) -> None:
+        # 先从 arc_core MCP 注销工具（防 disable 后工具仍被调用）
+        try:
+            if self.chat_config.get("mcp_register_tools", True):
+                mcp_registration.unregister_from_arc_core(self)
+        except Exception:
+            pass
         try:
             self.astrbot_client.stop()
         except Exception:
@@ -1995,6 +2037,8 @@ class ARCAIHelperPlugin(Plugin):
                 "op_permission_level": "admin",
                 "permission_overrides": {},
                 "local_agent_max_tool_rounds": 8,
+                # 把 mc_* 工具注册进 arc_core 的 MCP 服务器（0.9.90+），供本地 AI 客户端直用
+                "mcp_register_tools": True,
                 # 虚拟玩家身体（由 arc_fake_player 提供的 SimulatedPlayer）。
                 # enabled=true 时天星会一直以该名字的假人形态在线，
                 # 并可用 mc_body_* 工具操控身体（走过去/说话/丢东西…）。
@@ -2058,6 +2102,7 @@ class ARCAIHelperPlugin(Plugin):
         data.setdefault("op_permission_level", "admin")
         data.setdefault("permission_overrides", {})
         data.setdefault("local_agent_max_tool_rounds", 8)
+        data.setdefault("mcp_register_tools", True)
         data.setdefault("devotion", dict(DEFAULT_DEVOTION_CONFIG))
         data.setdefault("virtual_player_enabled", False)
         data.setdefault("virtual_player_name", "TianXing")
