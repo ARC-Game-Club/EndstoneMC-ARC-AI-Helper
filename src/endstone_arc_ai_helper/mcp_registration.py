@@ -12,6 +12,7 @@
 """
 from typing import Any, Callable, Dict, List
 
+from .ai_permission import AIPermissionLevel, parse_permission_level
 from .local_agent_tools import (
     TOOL_NAME_TO_ACTION,
     build_local_agent_tools,
@@ -20,8 +21,12 @@ from .local_agent_tools import (
 # MCP 注册时使用的插件名（注销时按此键清理）
 MCP_PLUGIN_NAME = "arc_ai_helper"
 
-# MCP 通道固定按服主级委托（localhost + token 才能连上）
+# MCP 通道默认按服主级委托（localhost + token 才能连上，如 ZCode 直连）。
+# AstrBot 网关会在 on_using_llm_tool 钩子里把对话发起人档位写进
+# args["_mcp_caller_level"]（LLM 之后强制覆盖，无法伪造），有则优先。
 MCP_HUB_PERMISSION_LEVEL = "proxy_owner"
+
+MCP_CALLER_LEVEL_KEY = "_mcp_caller_level"
 
 # 与 arc_core mcp_server.BLOCKED_COMMAND_TOKENS 保持一致
 _MCP_BLOCKED_ROOTS = {"stop", "reload", "restart"}
@@ -44,12 +49,15 @@ def _has_blocked_root(command: str) -> bool:
 def _make_handler(plugin: Any, action: str) -> Callable[[Dict[str, Any]], Any]:
     """生成委托 run_ai_tool 的 MCP handler。
 
-    任何带 command 参数的工具（mc_run_command / mc_divine_intervention 等）
-    都过一遍硬拦名单，防止借 proxy_owner 档绕过 MCP 层红线。
+    档位路由：args 带 ``_mcp_caller_level``（AstrBot 钩子注入的发起人档位）时按
+    该档校验；缺失（ZCode 等服主直连）默认 proxy_owner。任何带 command 参数的
+    工具（mc_run_command / mc_divine_intervention 等）都过硬拦名单，防止借
+    proxy_owner 档绕过 MCP 层红线。
     """
 
     def handler(args: Dict[str, Any]) -> Any:
         args = dict(args or {})
+        caller_raw = args.pop(MCP_CALLER_LEVEL_KEY, None)
         command = str(args.get("command") or "")
         if command and _has_blocked_root(command):
             return {
@@ -59,11 +67,14 @@ def _make_handler(plugin: Any, action: str) -> Callable[[Dict[str, Any]], Any]:
                     "重启/重载必须由服主亲自操作，AI 不代劳。"
                 ),
             }
+        level = parse_permission_level(
+            caller_raw, default=AIPermissionLevel.PROXY_OWNER
+        )
         return plugin.run_ai_tool(
             action,
             args,
-            hub_permission_level=MCP_HUB_PERMISSION_LEVEL,
-            hub_is_op=True,
+            hub_permission_level=int(level),
+            hub_is_op=bool(level >= AIPermissionLevel.ADMIN),
         )
 
     return handler

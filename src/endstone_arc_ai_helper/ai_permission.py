@@ -2,14 +2,8 @@
 
 from __future__ import annotations
 
-import re
 from enum import IntEnum
 from typing import Any, Mapping
-
-_EXECUTE_ASSISTANT = re.compile(
-    r"\brun\s+(tp|teleport|effect|spawnpoint)\b",
-    re.IGNORECASE,
-)
 
 _HARMFUL_EFFECTS = frozenset(
     {
@@ -116,6 +110,49 @@ ASSISTANT_ALLOWED_ROOTS = frozenset(
         "execute",
     }
 )
+
+# 指令池（chat_config.json 的 command_pools 键）：每档位允许的命令根清单，
+# 条目 "*" = 全部（PROXY_OWNER_ONLY_ROOTS 仍硬拦，不受池影响）。
+# 默认值 = 历史硬编码行为：助手=白名单、管理员=全部（除敏感根）、代理服主=全部。
+DEFAULT_COMMAND_POOLS: dict[str, list[str]] = {
+    "assistant": sorted(ASSISTANT_ALLOWED_ROOTS),
+    "admin": ["*"],
+    "proxy_owner": ["*"],
+}
+
+
+def normalize_command_pools(raw: Any) -> dict[str, list[str]]:
+    """规范化指令池配置；缺省/非法档位回退默认。条目为命令根（小写、去斜杠）。"""
+    source = raw if isinstance(raw, Mapping) else {}
+    pools: dict[str, list[str]] = {}
+    for level in ("assistant", "admin", "proxy_owner"):
+        entries = source.get(level)
+        cleaned: list[str] = []
+        if isinstance(entries, (list, tuple, set, frozenset)):
+            for item in entries:
+                text = str(item or "").strip().lower().lstrip("/")
+                if text:
+                    cleaned.append(text)
+        pools[level] = cleaned if cleaned else list(DEFAULT_COMMAND_POOLS[level])
+    return pools
+
+
+DEFAULT_PARSED_COMMAND_POOLS: dict[str, list[str]] = normalize_command_pools(None)
+
+
+def _root_in_pool(root: str, pool: list[str]) -> bool:
+    if "*" in pool:
+        return True
+    return root in pool
+
+
+def _run_tail_root(normalized: str) -> str:
+    """``execute ... run <root>`` 的 root（小写）；找不到 run 或无后续 token 返回空串。"""
+    parts = normalized.split()
+    for index, token in enumerate(parts):
+        if token.lower() == "run" and index + 1 < len(parts):
+            return parts[index + 1].lower().lstrip("/")
+    return ""
 
 
 def parse_permission_level(raw: Any, default: AIPermissionLevel = AIPermissionLevel.ASSISTANT) -> AIPermissionLevel:
@@ -273,12 +310,18 @@ def validate_command_for_level(
     bound_player_name: str = "",
     is_bound_self_help: bool = False,
     allow_assistant_item_grant: bool = False,
+    pools: Any = None,
 ) -> tuple[bool, str]:
     """Return whether a console command is allowed for the given AI permission level.
 
     ``allow_assistant_item_grant``：仅神灵模式 ``mc_divine_intervention`` 的物品神恩
     可在助手档临时放行 ``give``（须已扣近期好感）；``mc_run_command`` 不可传此标志。
+
+    ``pools``：指令池配置（chat_config.json 的 ``command_pools``），None = 内置默认
+    （助手=ASSISTANT_ALLOWED_ROOTS 白名单、管理员/代理服主=全部）。``execute`` 需
+    root 在池内且 ``run`` 后的命令根也在池内。PROXY_OWNER_ONLY_ROOTS 恒硬拦。
     """
+    pool_map = normalize_command_pools(pools) if pools is not None else DEFAULT_PARSED_COMMAND_POOLS
     normalized = str(command or "").strip().lstrip("/").strip()
     if not normalized:
         return False, "命令为空"
@@ -298,23 +341,28 @@ def validate_command_for_level(
 
         return validate_bound_self_help_command(normalized, bound_player_name)
 
-    if level >= AIPermissionLevel.ADMIN:
-        return True, ""
+    is_admin = level >= AIPermissionLevel.ADMIN
+    pool = pool_map["admin" if is_admin else "assistant"]
+    tier_label = "管理员" if is_admin else "助手"
 
-    if root == "give" and allow_assistant_item_grant:
+    if root == "give" and not is_admin and allow_assistant_item_grant:
         if len(parts) >= 2 and parts[1].startswith("@"):
             return False, "助手级别 give 不可使用 @ 选择器"
         return True, ""
 
-    if root not in ASSISTANT_ALLOWED_ROOTS:
-        return False, f"助手级别不可用 /{root}，需要管理员及以上权限"
-
     if root == "execute":
-        if not _EXECUTE_ASSISTANT.search(normalized):
-            return False, "execute 仅允许 tp / effect / spawnpoint"
+        # execute 只是包装壳：判定实际执行的 run 后命令根是否在池内。
+        tail = _run_tail_root(normalized)
+        if not tail or not _root_in_pool(tail, pool):
+            return False, f"execute 仅允许 run 后接 {tier_label}指令池内的命令"
         return True, ""
 
-    if root == "effect" and len(parts) >= 3 and parts[2].lower() in _HARMFUL_EFFECTS:
+    if not _root_in_pool(root, pool):
+        if is_admin:
+            return False, f"管理员级别指令池不含 /{root}（可在 chat_config.json 的 command_pools.admin 中添加）"
+        return False, f"助手级别不可用 /{root}，需要管理员及以上权限"
+
+    if root == "effect" and not is_admin and len(parts) >= 3 and parts[2].lower() in _HARMFUL_EFFECTS:
         return False, "助手级别不允许使用负面效果"
 
     return True, ""

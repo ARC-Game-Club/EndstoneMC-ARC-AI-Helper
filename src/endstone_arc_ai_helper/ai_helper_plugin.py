@@ -18,7 +18,10 @@ except ImportError:
 
 from .ai_permission import (
     AIPermissionLevel,
+    DEFAULT_COMMAND_POOLS,
     level_display,
+    normalize_command_pools,
+    parse_permission_level,
     require_admin_level,
     resolve_permission_level,
     validate_command_for_level,
@@ -136,6 +139,9 @@ class ARCAIHelperPlugin(Plugin):
         self._upgrade_system_prompt_if_needed()
 
         self.chat_config: Dict[str, Any] = self._load_chat_config()
+        # 指令池（chat_config.json 的 command_pools）：三档 AI 可代执行命令的白名单，
+        # "*" = 全部（敏感根仍硬拦）。默认 = 历史行为（助手白名单/管理员全部）。
+        self._command_pools = normalize_command_pools(self.chat_config.get("command_pools"))
         self.system_prompt = self._load_text_file(self.system_prompt_path, DEFAULT_SYSTEM_PROMPT)
         self.persona_prompt = self._load_text_file(self.persona_path, DEFAULT_PERSONA)
         self.scripture_path = os.path.join(self.config_folder, "scripture.txt")
@@ -401,6 +407,21 @@ class ARCAIHelperPlugin(Plugin):
             payload_level=data.get("_hub_permission_level"),
             payload_is_op=bool(data.get("_hub_is_op")),
         )
+
+    def api_validate_command(self, level_raw: Any, command: str) -> tuple:
+        """供其他插件（QQ-Sync /mc cmd 等）按指令池校验命令。
+
+        level_raw：档位字符串/枚举（assistant/admin/proxy_owner，接受中文别名）。
+        返回 (ok, reason)；level 无效按助手档从严校验。
+        """
+        level = parse_permission_level(level_raw, default=AIPermissionLevel.ASSISTANT)
+        try:
+            return validate_command_for_level(
+                str(command or ""), level, pools=self._command_pools
+            )
+        except Exception as error:
+            self.logger.warning(f"[ARC AI Helper] api_validate_command error: {error}")
+            return False, f"校验异常: {error}"
 
     def run_ai_tool(
         self,
@@ -778,6 +799,7 @@ class ARCAIHelperPlugin(Plugin):
             level,
             bound_player_name=str(data.get("bound_player_name") or ""),
             is_bound_self_help=bool(data.get("is_bound_self_help", False)),
+            pools=self._command_pools,
         )
         if not ok:
             deny = reason or "没有权限：该指令不被允许"
@@ -1273,6 +1295,7 @@ class ARCAIHelperPlugin(Plugin):
                 command,
                 level,
                 allow_assistant_item_grant=bool(item_id),
+                pools=self._command_pools,
             )
             if not ok_cmd:
                 if paid:
@@ -2037,6 +2060,8 @@ class ARCAIHelperPlugin(Plugin):
                 "op_permission_level": "admin",
                 "permission_overrides": {},
                 "local_agent_max_tool_rounds": 8,
+                # 三档 AI 代执行指令池（"*"=全部除敏感根）；默认=历史行为
+                "command_pools": DEFAULT_COMMAND_POOLS,
                 # 把 mc_* 工具注册进 arc_core 的 MCP 服务器（0.9.90+），供本地 AI 客户端直用
                 "mcp_register_tools": True,
                 # 虚拟玩家身体（由 arc_fake_player 提供的 SimulatedPlayer）。
@@ -2102,6 +2127,7 @@ class ARCAIHelperPlugin(Plugin):
         data.setdefault("op_permission_level", "admin")
         data.setdefault("permission_overrides", {})
         data.setdefault("local_agent_max_tool_rounds", 8)
+        data.setdefault("command_pools", DEFAULT_COMMAND_POOLS)
         data.setdefault("mcp_register_tools", True)
         data.setdefault("devotion", dict(DEFAULT_DEVOTION_CONFIG))
         data.setdefault("virtual_player_enabled", False)
@@ -2685,7 +2711,7 @@ class ARCAIHelperPlugin(Plugin):
                 continue
 
             normalized_command_line = command_line.lstrip("/").strip()
-            ok, reason = validate_command_for_level(normalized_command_line, level)
+            ok, reason = validate_command_for_level(normalized_command_line, level, pools=self._command_pools)
             if not ok:
                 if sender is not None:
                     sender.send_message(f"§c{assistant_tag} {reason or '指令已被拦截'}")

@@ -107,7 +107,7 @@ def test_handler_delegates_with_owner_level():
     assert result == {"ok": True, "text": "ran list"}
     call = plugin.calls[0]
     assert call["action"] == "list"
-    assert call["hub_permission_level"] == MCP_HUB_PERMISSION_LEVEL
+    assert call["hub_permission_level"] == int(AIPermissionLevel.PROXY_OWNER)
     assert call["hub_is_op"] is True
 
 
@@ -186,3 +186,96 @@ def test_register_old_arc_core_version():
 
 def test_unregister_without_arc_core():
     assert unregister_from_arc_core(StubPlugin(arc_core=False)) is False
+
+
+# ---------------------------------------------------------------------------
+# _mcp_caller_level 档位路由 + 指令池配置化
+# ---------------------------------------------------------------------------
+
+from endstone_arc_ai_helper.ai_permission import (  # noqa: E402
+    AIPermissionLevel,
+    DEFAULT_COMMAND_POOLS,
+    normalize_command_pools,
+    validate_command_for_level,
+)
+
+
+def test_handler_uses_injected_caller_level():
+    plugin = StubPlugin()
+    specs = {s["name"]: s for s in build_mcp_registry(plugin)}
+    specs["mc_run_command"]["handler"]({"command": "list", "_mcp_caller_level": "assistant"})
+    call = plugin.calls[0]
+    assert call["hub_permission_level"] == int(AIPermissionLevel.ASSISTANT)
+    assert call["hub_is_op"] is False
+    # 字段不得残留在 args 里
+    assert "_mcp_caller_level" not in call["args"]
+
+
+def test_handler_missing_level_defaults_owner():
+    plugin = StubPlugin()
+    specs = {s["name"]: s for s in build_mcp_registry(plugin)}
+    specs["mc_run_command"]["handler"]({"command": "list"})
+    assert plugin.calls[0]["hub_permission_level"] == int(AIPermissionLevel.PROXY_OWNER)
+
+
+def test_handler_garbage_level_defaults_owner():
+    plugin = StubPlugin()
+    specs = {s["name"]: s for s in build_mcp_registry(plugin)}
+    specs["mc_run_command"]["handler"]({"command": "list", "_mcp_caller_level": "hacker"})
+    assert plugin.calls[0]["hub_permission_level"] == int(AIPermissionLevel.PROXY_OWNER)
+
+
+def test_normalize_pools_defaults():
+    pools = normalize_command_pools(None)
+    assert pools["admin"] == ["*"]
+    assert set(pools["assistant"]) == set(DEFAULT_COMMAND_POOLS["assistant"])
+    # 非法输入回退
+    pools = normalize_command_pools({"assistant": "not-a-list", "admin": [], "proxy_owner": None})
+    assert pools["assistant"] == list(DEFAULT_COMMAND_POOLS["assistant"])
+    assert pools["admin"] == ["*"]
+    # 清理空白/斜杠
+    pools = normalize_command_pools({"assistant": ["/TP", " msg ", ""]})
+    assert pools["assistant"] == ["tp", "msg"]
+
+
+def test_pool_admin_star_keeps_legacy_behavior():
+    """admin=["*"]（默认）= 历史行为：非敏感根全放行。"""
+    pools = normalize_command_pools(None)
+    ok, _ = validate_command_for_level("gamemode creative Steve", AIPermissionLevel.ADMIN, pools=pools)
+    assert ok
+    ok, _ = validate_command_for_level("give Steve diamond 64", AIPermissionLevel.ADMIN, pools=pools)
+    assert ok
+    ok, _ = validate_command_for_level("stop", AIPermissionLevel.ADMIN, pools=pools)
+    assert not ok  # 敏感根仍硬拦
+
+
+def test_pool_admin_explicit_whitelist():
+    pools = normalize_command_pools({"admin": ["give", "gamemode"]})
+    ok, _ = validate_command_for_level("give Steve diamond 1", AIPermissionLevel.ADMIN, pools=pools)
+    assert ok
+    ok, reason = validate_command_for_level("time set day", AIPermissionLevel.ADMIN, pools=pools)
+    assert not ok and "time" in reason
+    # execute 穿透：root 与 run 后根都要在池内
+    ok, _ = validate_command_for_level("execute as Steve run give Steve diamond 1", AIPermissionLevel.ADMIN, pools=pools)
+    assert ok
+    ok, _ = validate_command_for_level("execute as Steve run time set day", AIPermissionLevel.ADMIN, pools=pools)
+    assert not ok
+
+
+def test_pool_assistant_custom_entry():
+    pools = normalize_command_pools({"assistant": ["tp", "say"]})
+    ok, _ = validate_command_for_level("say hello", AIPermissionLevel.ASSISTANT, pools=pools)
+    assert ok
+    ok, _ = validate_command_for_level("effect Steve speed 30", AIPermissionLevel.ASSISTANT, pools=pools)
+    assert not ok  # effect 不在自定义池
+    # execute 穿透到自定义池
+    ok, _ = validate_command_for_level("execute as Steve run say hi", AIPermissionLevel.ASSISTANT, pools=pools)
+    assert ok
+    ok, _ = validate_command_for_level("execute as Steve run effect Steve speed 30", AIPermissionLevel.ASSISTANT, pools=pools)
+    assert not ok  # effect 不在自定义池
+
+
+def test_pool_proxy_owner_always_full():
+    pools = normalize_command_pools({"proxy_owner": ["list"]})
+    ok, _ = validate_command_for_level("op Steve", AIPermissionLevel.PROXY_OWNER, pools=pools)
+    assert ok  # proxy_owner 恒全放行，池不影响
