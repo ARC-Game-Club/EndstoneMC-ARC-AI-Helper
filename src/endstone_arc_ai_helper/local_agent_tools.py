@@ -13,6 +13,7 @@ TOOL_NAME_TO_ACTION: Dict[str, str] = {
     "mc_economy": "economy",
     "mc_land": "land",
     "mc_landmarks": "landmarks",
+    "mc_arc_tp": "arc_tp",
     "mc_jail_player": "jail",
     "mc_release_player": "release",
     "mc_list_prisoners": "prisoners",
