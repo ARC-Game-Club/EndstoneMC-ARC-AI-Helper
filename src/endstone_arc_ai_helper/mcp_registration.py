@@ -80,17 +80,24 @@ def _make_handler(plugin: Any, action: str) -> Callable[[Dict[str, Any]], Any]:
     return handler
 
 
-def _openai_tool_to_spec(tool: Dict[str, Any], plugin: Any) -> Dict[str, Any]:
-    """OpenAI function 格式 → arc_core MCP 注册表条目。"""
+def _openai_tool_to_spec(tool: Dict[str, Any], plugin: Any, server_label: str = "") -> Dict[str, Any]:
+    """OpenAI function 格式 → arc_core MCP 注册表条目。
+
+    描述头部追加 [服务器: xxx]——多服聚合接入一个 LLM 时帮模型按用户说的
+    服名选对前缀工具（与 ArcCore 内建工具的「作用于服务器」标注同款语义）。
+    """
     fn = tool.get("function") or {}
     name = str(fn.get("name") or "").strip()
     action = TOOL_NAME_TO_ACTION.get(name, name)
     parameters = fn.get("parameters")
     if not isinstance(parameters, dict):
         parameters = {"type": "object", "properties": {}}
+    description = str(fn.get("description") or name)
+    if server_label:
+        description = f"[服务器: {server_label}] {description}"
     return {
         "name": name,
-        "description": str(fn.get("description") or name),
+        "description": description,
         "schema": parameters,
         "handler": _make_handler(plugin, action),
     }
@@ -98,6 +105,11 @@ def _openai_tool_to_spec(tool: Dict[str, Any], plugin: Any) -> Dict[str, Any]:
 
 def build_mcp_registry(plugin: Any) -> List[Dict[str, Any]]:
     """生成当前插件能力下的全部 MCP 工具条目（与本地 Agent 模式同源同条件）。"""
+    getter = getattr(plugin, "get_game_server_name", None)
+    try:
+        server_label = str(getter()).strip() if callable(getter) else ""
+    except Exception:
+        server_label = ""
     openai_tools = build_local_agent_tools(
         has_prison=getattr(plugin, "_get_prison_plugin", lambda: None)() is not None,
         has_arc_core=getattr(plugin, "_get_arc_core_plugin", lambda: None)() is not None,
@@ -105,7 +117,7 @@ def build_mcp_registry(plugin: Any) -> List[Dict[str, Any]]:
         has_devotion=bool(getattr(plugin, "_is_devotion_enabled", lambda: False)()),
         has_body=getattr(plugin, "_get_fake_player_plugin", lambda: None)() is not None,
     )
-    specs = [_openai_tool_to_spec(tool, plugin) for tool in openai_tools]
+    specs = [_openai_tool_to_spec(tool, plugin, server_label) for tool in openai_tools]
     # devotion 工具已由 build_local_agent_tools(has_devotion=True) 分支包含，
     # 与本地 Agent 模式同条件，无需单独注入；按名字去重（保序，先到先得）。
     seen: set = set()

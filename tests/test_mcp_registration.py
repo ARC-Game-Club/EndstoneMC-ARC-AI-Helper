@@ -188,6 +188,26 @@ def test_unregister_without_arc_core():
     assert unregister_from_arc_core(StubPlugin(arc_core=False)) is False
 
 
+class NamedStubPlugin(StubPlugin):
+    """带服务器名的桩：注册描述应自报身份。"""
+
+    def get_game_server_name(self):
+        return "弧光无规则生存服"
+
+
+def test_registry_descriptions_carry_server_label():
+    specs = build_mcp_registry(NamedStubPlugin())
+    assert specs
+    for spec in specs:
+        assert spec["description"].startswith("[服务器: 弧光无规则生存服] "), spec["name"]
+
+
+def test_registry_without_name_has_no_label():
+    specs = build_mcp_registry(StubPlugin())
+    for spec in specs:
+        assert not spec["description"].startswith("[服务器"), spec["name"]
+
+
 # ---------------------------------------------------------------------------
 # _mcp_caller_level 档位路由 + 指令池配置化
 # ---------------------------------------------------------------------------
